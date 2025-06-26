@@ -1,0 +1,6 @@
+sample_id: Sample_26
+n_clusters: 7
+k_neighbors: 6
+gene_pcs: 10
+refinement_radius: 30
+clustering_method: Proust

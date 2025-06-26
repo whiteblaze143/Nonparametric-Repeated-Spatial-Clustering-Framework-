@@ -1,0 +1,555 @@
+---
+title: "Cell Type-Based Spatial Clustering Analysis"
+author: "Mithun & Rajitha"
+format: 
+  pdf:
+    toc: true
+    number-sections: true
+editor: visual
+execute: 
+  warning: false
+---
+
+#------------------------------------------------------------------------------ \# Required Libraries #------------------------------------------------------------------------------
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load libraries required for spatial data processing, clustering, plotting, and data manipulation
+library(SpatialExperiment)  # For handling spatial transcriptomics data
+library(spdep)              # For spatial dependence and neighborhood analysis
+library(adespatial)         # For constrained hierarchical clustering
+library(ggplot2)            # For visualization of spatial data
+library(dplyr)              # For data manipulation and transformation
+library(tidyr)              # For data reshaping and pivoting
+library(tibble)             # For enhanced data frame operations
+library(cluster)            # For clustering algorithms
+library(igraph)             # For graph-based operations in merging
+library(reshape2)           # For reshaping data for visualization
+```
+
+#------------------------------------------------------------------------------ \# 1. DATA LOADING AND PREPARATION #------------------------------------------------------------------------------
+
+```{r data_loading}
+# Load the SpatialExperiment object containing TNBC data
+load("03_TNBC_2018_spe.rds")
+
+# Select a specific patient sample for analysis
+sample_number <- "Sample_05"
+spe_patient <- spe[, spe$sample_id == sample_number]
+
+# Create a data frame with cell IDs and their corresponding cell types
+cell_types_df <- tibble(
+  cellID = colnames(spe_patient),
+  cell_type = spe_patient$mm  # mm column contains cell phenotype information
+)
+
+# Display unique cell types for verification and documentation
+print("Unique cell types in the dataset:")
+unique_types <- unique(cell_types_df$cell_type)
+print(unique_types)
+
+# Convert cell types to binary feature matrix using one-hot encoding
+feature_mat <- cell_types_df %>%
+  mutate(present = 1) %>%  # Mark presence with 1
+  pivot_wider(
+    id_cols = cellID,
+    names_from = cell_type,
+    values_from = present,
+    values_fill = list(present = 0)  # Mark absence with 0
+  )
+
+# Extract spatial coordinates for each cell
+coords_mat <- as.data.frame(spatialCoords(spe_patient)) %>%
+  rownames_to_column(var = "cellID")
+colnames(coords_mat)[2:3] <- c("X", "Y")  # Standardize coordinate column names
+
+# Define feature columns (exclude cellID)
+feature_cols <- setdiff(names(feature_mat), "cellID")
+
+#Create dataframe
+patient_data <- coords_mat %>%
+  select(cellID, X, Y) %>%
+  left_join(feature_mat, by = "cellID") %>%
+  select(X, Y, all_of(feature_cols), cellID)  #  X, Y first, then features, then cellID
+
+# Prepare matrices for distance calculation and clustering
+feature_mat_for_dist <- feature_mat %>% column_to_rownames(var = "cellID")
+coords_mat_for_dist <- coords_mat %>% column_to_rownames(var = "cellID")
+
+# Calculate binary distance matrix between cells based on cell type
+dist_features <- dist(feature_mat_for_dist, method = "binary")
+```
+
+#------------------------------------------------------------------------------ \# 2. PARAMETER SELECTION AND CLUSTERING #------------------------------------------------------------------------------
+
+```{r}
+# Define parameter ranges to test for optimal clustering
+unique_types <- unique(cell_types_df$cell_type)
+num_cell_types <- length(unique_types)
+  
+  # Set cluster range based on cell types (with min of 4)
+min_clusters <- 4
+max_clusters <- min(16, num_cell_types)  # Cap at 16 or number of cell types, whichever is smaller
+num_clusters <- min_clusters:max_clusters
+  
+num_neighbors <- c(4:8)  # Testing 4 to 8 neighbors
+
+# Evaluate clustering quality using modified silhouette scores
+source("evaluate_silhouette.R")
+avg_sils <- evaluate_modified_silhouette(
+  num_clusters, num_neighbors, "ward.D2", 
+  dist_features, coords_mat_for_dist, plot = FALSE
+)
+```
+
+```{r parameter_tuning}
+# Find parameters that yield the highest average modified silhouette score
+optimal_params <- avg_sils %>% 
+  arrange(desc(avg_modified_sil)) %>% 
+  slice(1)
+print(paste("Optimal parameters: k =", optimal_params$num_clusters, 
+            "neighbors =", optimal_params$num_neighbors))
+
+# Use the identified optimal parameters for clustering
+knn <- optimal_params$num_neighbors
+k <- optimal_params$num_clusters
+
+# Build spatial neighborhood structure for constrained clustering
+nb <- knn2nb(knearneigh(coords_mat_for_dist, k = knn)) %>% nb2listw(style = "W")
+neighbors <- listw2sn(nb)[, 1:2]  # Convert to simple neighbor list format
+
+# Perform constrained hierarchical clustering
+constr.clust <- constr.hclust(
+  d = dist_features,
+  method = "ward.D2",  # Ward's method minimizes within-cluster variance
+  links = neighbors,   # Spatial neighborhood constraints
+  coords = coords_mat_for_dist
+)
+
+# Cut dendrogram to obtain the optimal number of clusters
+patient_data$region <- as.factor(cutree(constr.clust, k = k))
+
+# Report cluster sizes for evaluation
+cluster_sizes <- table(patient_data$region)
+print("Cluster sizes:")
+print(cluster_sizes)
+```
+
+#------------------------------------------------------------------------------ \# 3. CLUSTER ANALYSIS AND VISUALIZATION #------------------------------------------------------------------------------
+
+```{r cluster_visualization}
+# Calculate cell type composition of each identified cluster
+cluster_composition <- patient_data %>%
+  select(region, all_of(feature_cols)) %>%
+  group_by(region) %>%
+  summarize(across(everything(), sum)) %>%  # Count cells of each type
+  mutate(total = rowSums(across(where(is.numeric)))) %>%  # Calculate total cells
+  mutate(across(where(is.numeric) & !matches("total"), ~./total))  # Convert to proportions
+
+# Identify the dominant cell type in each cluster
+dominant_cell_type <- cluster_composition %>%
+  select(-total) %>%
+  pivot_longer(cols = -region, names_to = "cell_type", values_to = "proportion") %>%
+  group_by(region) %>%
+  slice_max(order_by = proportion, n = 1) %>%  # Get cell type with highest proportion
+  select(region, dominant_type = cell_type, proportion)
+
+print(dominant_cell_type)
+
+# Define a colorblind-friendly color palette with enough colors for all clusters
+cb_palette_extended <- c("#E69F00", "#CC79A7", "#56B4E9", "#009E73", 
+                         "#0072B2", "#D55E00", "#F0E442", "#999999", 
+                         "#882255", "#661100","#661", "#009",
+                         "#087", "#F40","#C20","#30F")
+
+# Visualize the spatial distribution of clusters
+g_regions <- ggplot(patient_data, aes(x = X, y = Y, color = region)) +
+  geom_point() +
+  scale_color_manual(values = cb_palette_extended) +
+  coord_equal() +  # Maintain aspect ratio for accurate spatial representation
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+
+print(g_regions)
+```
+
+#------------------------------------------------------------------------------ \# 4. BLOCK CREATION - SPATIAL BASED (PROPOSED METHOD) #------------------------------------------------------------------------------
+
+```{r block_creation}
+# Source the block creation function
+source("create_blocks.R")
+
+# Number of spatial dimensions (X, Y) to use for block creation
+num_spatial_dims <- 2
+
+# Create blocks with appropriate size constraints
+blocked_data <- create_blocks(patient_data, num_spatial_dims, knn)
+
+# Print the result structure for verification
+print(paste("Created", length(unique(blocked_data$polygon_id)), "blocks across", 
+            length(unique(blocked_data$region)), "regions"))
+```
+
+```{r}
+#------------------------------------------------------------------------------ 
+# VALIDATION OF THEORETICAL REFINEMENTS
+#------------------------------------------------------------------------------
+
+# 1. Validate heterogeneity-based modulation
+heterogeneity_validation <- blocked_data %>%
+  group_by(region) %>%
+  summarize(
+    num_blocks = n_distinct(polygon_id),
+    num_cells = n(),
+    blocks_per_cell = num_blocks / num_cells * 100  # Normalized measure
+  )
+
+# Plot relationship between heterogeneity and block density
+ggplot(heterogeneity_validation, 
+       aes(x = as.numeric(as.factor(region)), y = blocks_per_cell)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Block Density by Region",
+       subtitle = "Higher values indicate more blocks relative to region size",
+       x = "Region", y = "Blocks per 100 cells") +
+  theme_minimal()
+
+# 2. Validate power optimization by block size distribution
+block_size_dist <- blocked_data %>%
+  group_by(polygon_id) %>%
+  summarize(size = n()) %>%
+  ungroup()
+
+# Plot histogram of block sizes
+ggplot(block_size_dist, aes(x = size)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = 20, color = "red", linetype = "dashed") +
+  annotate("text", x = 20, y = max(table(cut(block_size_dist$size, breaks = 20)))/2, 
+           label = "Minimum for\nstatistical power", hjust = -0.1) +
+  labs(title = "Distribution of Block Sizes",
+       subtitle = "Power-optimized blocks should maintain adequate sample sizes",
+       x = "Number of Cells per Block", y = "Frequency") +
+  theme_minimal()
+
+```
+
+#------------------------------------------------------------------------------ \# 5. STATISTICAL VALIDATION OF BLOCK CREATION #------------------------------------------------------------------------------
+
+```{r block_validation}
+# Check block size distribution for adequate sample sizes
+block_size_dist <- blocked_data %>%
+  group_by(polygon_id) %>%
+  summarize(size = n()) %>%
+  ungroup()
+
+print("Block size summary statistics:")
+print(summary(block_size_dist$size))
+
+# Check block homogeneity for cell types
+block_homogeneity <- blocked_data %>% 
+  group_by(polygon_id) %>% 
+  summarise(across(all_of(feature_cols), function(x) mean(x != 0))) %>%
+  pivot_longer(-polygon_id) %>%
+  group_by(polygon_id) %>%
+  summarize(
+    mean_cell_type_purity = mean(value),
+    max_cell_type_purity = max(value)
+  )
+
+print("Block homogeneity summary:")
+print(summary(block_homogeneity))
+
+
+
+# Calculate meaningful feature values for each block
+block_centroids <- blocked_data %>%
+  group_by(polygon_id) %>%
+  summarize(
+    X = mean(X),
+    Y = mean(Y),
+    # Calculate proportion of dominant cell type in each block
+    feature_val = {
+      type_counts <- colSums(across(all_of(feature_cols)))
+      max(type_counts)/sum(type_counts)
+    },
+    # Store the dominant cell type name
+    dominant_type = names(which.max(colSums(across(all_of(feature_cols)))))
+  )
+
+# # Visualize blocks by dominant cell type, use when checking blocks
+# ggplot() +
+#   # Plot cells with block colors
+#   geom_point(data = blocked_data, aes(x = X, y = Y, color = polygon_id), alpha = 0.5) +
+#   # Add block centroids labeled by dominant cell type
+#   geom_label(data = block_centroids, aes(x = X, y = Y, label = dominant_type),
+#              size = 3, fontface = "bold") +
+#   coord_equal() +
+#   labs(title = "Spatial Distribution of Blocks by Dominant Cell Type") +
+#   theme_minimal()
+```
+
+#------------------------------------------------------------------------------ \# 6. MMD TESTING FOR STATISTICAL CLUSTER SIMILARITY #------------------------------------------------------------------------------
+
+```{r mmd_testing}
+# Perform pairwise MMD tests between clusters
+source("mmd_tests.R")
+test_results <- multiple_comparison(
+  blocked_data,
+  as.matrix(dist_features),
+  kernel = "IMQ",
+  kernel_param = 1,
+  nperm = 200,
+  adj_p = "BH"
+)
+
+print("MMD test results:")
+print(test_results)
+
+
+###alternate to pairwise evaluation?
+# Identify clusters that are NOT significantly different
+similar_clusters <- test_results %>%
+  filter(adj_p >= 0.05) %>%
+  select(region_1, region_2)
+
+print("Similar clusters (candidates for merging):")
+print(similar_clusters)
+
+# Create adjacency matrix from test results
+all_regions <- sort(unique(c(test_results$region_1, test_results$region_2)))
+adj_matrix <- matrix(0, nrow=length(all_regions), ncol=length(all_regions))
+rownames(adj_matrix) <- all_regions
+colnames(adj_matrix) <- all_regions
+
+# Fill adjacency matrix - 1 indicates similar regions
+for(i in 1:nrow(similar_clusters)) {
+  r1 <- as.character(similar_clusters$region_1[i])
+  r2 <- as.character(similar_clusters$region_2[i])
+  adj_matrix[r1, r2] <- 1
+  adj_matrix[r2, r1] <- 1  # Make symmetric
+}
+
+# Print cluster similarity relationships
+cat("\nCluster similarity relationships:\n")
+for(r1 in all_regions) {
+  connections <- names(which(adj_matrix[r1,] == 1))
+  if(length(connections) > 0) {
+    cat(paste0("Cluster ", r1, " is similar to: ", paste(connections, collapse=", "), "\n"))
+  } else {
+    cat(paste0("Cluster ", r1, " is distinct from all others\n"))
+  }
+}
+```
+
+-   Store the results as a matrix and plot the graph
+
+```{r}
+# Source the script that builds the pairwise results graph.
+source("evaluate_pairwise_results.R")
+#results_matrix <- pairwise_results_to_matrix_og(test_results, plot = TRUE)
+
+# Convert the pairwise test results into an adjacency matrix and plot the corresponding graph.
+results_matrix <- pairwise_results_to_matrix(test_results, plot = TRUE)
+
+```
+
+-   Re-partitioning based on the graph
+
+The pairwise graph indicates that certain clusters have similar feature distributions. Merging these clusters can improve interpretability
+
+**Manual Merging:**
+
+Here the decision is made to merge clusters into two groups, "A" and "B", based on prior statistical evidence
+
+```{r}
+
+# Re-calculate clusters from the constrained hierarchical clustering result.
+clusters <- cutree(constr.clust, k = 16)
+
+
+# Clusters that merge togather
+clusters[clusters %in% c(1,10,13,16)] <- "A"
+clusters[clusters %in% c(2)] <- "B"
+clusters[clusters %in% c(3,6,7,8,11,15)] <- "C"
+clusters[clusters %in% c(4)] <- "D"
+clusters[clusters %in% c(5)] <- "E"
+clusters[clusters %in% c(6,3,8,11)] <- "F"
+clusters[clusters %in% c(8,3,6,7,11)] <- "G"
+clusters[clusters %in% c(9,12,14)] <- "H"
+clusters[clusters %in% c(15,3)] <- "I"
+clusters[clusters %in% c(16,1)] <- "J"
+
+
+
+# Convert the merged cluster labels back into numeric factors.
+# This step renumbers the groups to facilitate further analysis.
+patient_data$repartitioned_clusters <- as.factor(as.integer(as.factor(clusters)))
+```
+
+-   Plotting the re-partitioned clusters
+
+```{r}
+
+# Define a color palette for the new clusters.
+cb_palette <- c("#E69F00", "#56B4E9", "#CC79A7", "#009E73", "#0072B2", "#D55E00", "#F0E442")
+
+# Create a plot of the spatial coordinates with colors representing the re-partitioned clusters.
+g_repart <- ggplot(patient_data, aes(x = X, y = Y, color = repartitioned_clusters)) +
+  geom_point() +
+  scale_color_manual(values = cb_palette) +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text = element_text(size = 12),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    legend.title = element_text(size = 12)
+  )
+  # labs(title = "Repartitioned Clusters")  # Optional title.
+
+# Display the re-partitioned clusters plot.
+g_repart
+```
+
+-   Proportion of tumor cells captured by the cluster that predominantly contains tumor cells.
+
+```{r}
+
+# Count the number of cells of each type within each re-partitioned cluster.
+cluster_cell_counts <- patient_data %>%
+  count(cellID, repartitioned_clusters) %>% rename(count = n)
+
+# Count the total number of cells of each type across the entire dataset.
+cell_counts <- patient_data %>%
+  count(cellID) %>% rename(total_cells = n)
+
+# Merge the two count tables to calculate the proportion of each cell type within each cluster.
+summary <- left_join(cluster_cell_counts, cell_counts, by = "cellID")
+summary['Proportion'] <- summary['count'] / summary['total_cells']
+summary
+```
+
+-   Saving the ggplots
+
+```{r}
+# ----- Saving the Visual Outputs -----
+
+# Save the re-partitioned clusters plot to a PNG file.
+ggsave("re_part_05.png", plot = g_repart, width = 7, height = 5, units = "in")
+
+
+```
+
+-   Saving the pairwise results plot
+
+```{r}
+# Save the pairwise results graph as a PNG file.
+# Open a PNG device for output with specified dimensions and resolution.
+png("pwr_05.png", width = 5, height = 3, units = "in", res = 300)
+
+# Re-run the function to generate the pairwise results graph (this will plot to the PNG device).
+results_matrix <- pairwise_results_to_matrix(test_results, plot = TRUE)
+results_matrix
+
+# Close the PNG device to finish saving the file.
+dev.off()
+```
+
+#------------------------------------------------------------------------------ \# 7. 3MT PRESENTATION FIGURES #------------------------------------------------------------------------------
+
+```{r}
+#| echo: true
+library(gridExtra)
+library(ggplot2) # Ensure ggplot2 is loaded for plot modifications
+
+# --- Generate Figures for Slide 2 --- 
+
+# Plot 1: Initial Clusters (Save as initial_clusters_plot.png)
+initial_clusters_plot <- ggplot(patient_data, aes(x = X, y = Y, color = region)) +
+  geom_point(size=1.0) +
+  scale_color_manual(values = cb_palette_extended) + # Use palette defined earlier
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size=14, face="bold", hjust = 0.5),
+    axis.text = element_text(size=10),
+    axis.title = element_text(size=12)
+  ) +
+  labs(title = "Initial Clusters")
+
+# Save Plot 1
+ggsave("initial_clusters_plot.png", initial_clusters_plot, width = 4.5, height = 4, units = "in", dpi=300)
+
+# Plot 2: Pairwise Similarity Graph (Save as similarity_graph.png)
+# Source the script containing the plotting function
+source("evaluate_pairwise_results.R") 
+
+# Open a PNG device for the similarity graph
+png("similarity_graph.png", width = 4.5, height = 4, units = "in", res = 300)
+
+# Generate the plot directly to the PNG device
+pairwise_results_to_matrix(test_results, plot = TRUE)
+
+# Close the PNG device
+dev.off()
+
+# --- Generate Figure for Slide 3 --- (Combined plot)
+
+# Plot 3: Repartitioned Clusters (after MMD-based merging)
+repartitioned_clusters_plot <- ggplot(patient_data, aes(x = X, y = Y, color = repartitioned_clusters)) +
+  geom_point(size=1.0) +
+  scale_color_manual(values = cb_palette) + # Use palette defined earlier
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size=14, face="bold", hjust = 0.5),
+    axis.text = element_text(size=10),
+    axis.title = element_text(size=12)
+  ) +
+  labs(title = "Repartitioned Clusters") 
+
+# Plot 4: Ground Truth Cell Types
+# Create a dataframe with coordinates and cell types directly from the source
+cell_types_spatial <- data.frame(
+  X = spatialCoords(spe_patient)[,1],
+  Y = spatialCoords(spe_patient)[,2],
+  cell_type = spe_patient$mm
+)
+
+# Cell types plot (no legend for combined figure)
+cell_types_plot_no_legend <- ggplot(cell_types_spatial, aes(x = X, y = Y, color = cell_type)) +
+  geom_point(size=1.0) +
+  # Custom color palette for all cell types
+  scale_color_manual(values = c( 
+    "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#999999",
+    "#882255", "#661100", "#44AA99", "#332288", "#117733", "#AA4499", "#88CCEE", "#6699CC" 
+  )) +
+  coord_equal() +
+  # Ensure all data points are shown
+  scale_x_continuous(limits = c(min(cell_types_spatial$X), max(cell_types_spatial$X))) +
+  scale_y_continuous(limits = c(min(cell_types_spatial$Y), max(cell_types_spatial$Y))) +
+  theme_minimal() +
+  theme(
+    legend.position = "none", # No legend in combined plot
+    plot.title = element_text(size=14, face="bold", hjust = 0.5),
+    axis.text = element_text(size=10),
+    axis.title = element_text(size=12)
+  ) +
+  labs(title = "Cell Types")
+
+# Arrange Slide 3 plots side-by-side
+slide3_combined_plot <- grid.arrange(
+  repartitioned_clusters_plot, 
+  cell_types_plot_no_legend, 
+  ncol=2)
+
+# Save Slide 3 figure (matches the filename in the LaTeX file)
+ggsave("figure_slide3.png", slide3_combined_plot, width = 9, height = 4, units = "in", dpi=300)
+```

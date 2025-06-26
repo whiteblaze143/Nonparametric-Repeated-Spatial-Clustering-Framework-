@@ -1,0 +1,6 @@
+sample_id: Sample_05
+n_clusters: 4
+k_neighbors: 8
+gene_pcs: 25
+refinement_radius: 15
+clustering_method: Leiden
