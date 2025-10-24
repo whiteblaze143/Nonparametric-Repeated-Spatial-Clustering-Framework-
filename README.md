@@ -116,19 +116,11 @@ pip install -e .
 
 ## References
 
-If using this software, please cite:
+If using this software, please cite Proust:
 
 Yao et al. (2024). Spatial domain detection using contrastive self-supervised learning for spatial multi-omics technologies. bioRxiv.
 
-@misc{senanayake2025robustnonparametricframeworkdetecting,
-      title={A Robust Nonparametric Framework for Detecting Repeated Spatial Patterns}, 
-      author={Rajitha Senanayake and Pratheepa Jeganathan},
-      year={2025},
-      eprint={2506.14103},
-      archivePrefix={arXiv},
-      primaryClass={stat.ME},
-      url={https://arxiv.org/abs/2506.14103}, 
-}
+Senanayake, R., & Jeganathan, P. (2025). A Robust Nonparametric Framework for Detecting Repeated Spatial Patterns. arXiv preprint arXiv:2506.14103.
 
 ## License
 
