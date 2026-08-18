@@ -4,6 +4,8 @@
 
 Proust is a computational framework for integrated spatial transcriptomics analysis that combines gene expression data with histology images to identify and analyze spatial domains in tissue samples.
 
+### UPDATE 08/2026: check out the official python package for the python implementation!(https://github.com/amanpreet60/repspat)
+
 ## Output Visualization
 
 ![Proust Clusters](Sample_26_clusters.png)
